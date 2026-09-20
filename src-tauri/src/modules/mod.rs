@@ -7,6 +7,7 @@ pub mod antigravity_legacy_instance;
 pub mod antigravity_paths;
 pub mod antigravity_switch_history;
 pub mod app_lifecycle;
+pub mod at_rest;
 pub mod atomic_write;
 pub mod auto_local_import;
 pub mod backup_storage;

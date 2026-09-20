@@ -313,6 +313,12 @@ fn summarize_deep_link_args(args: &[String]) -> Vec<String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // at-rest 取钥助手模式：提权实例只做「扫内存取钥 + 落盘缓存」就退出。
+    // 必须抢在 logger / 单实例插件之前 —— 否则参数会被转发给已运行的主实例，
+    // 提权实例直接退出，密钥永远扫不到。
+    if let Some(code) = modules::at_rest::try_helper_mode() {
+        std::process::exit(code);
+    }
     logger::init_logger();
     modules::diagnostics::install_panic_hook();
     modules::diagnostics::start_frontend_ready_watchdog();

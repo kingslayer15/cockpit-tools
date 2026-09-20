@@ -876,7 +876,13 @@ pub fn import_from_json(json_content: &str) -> Result<Vec<CodebuddyAccount>, Str
     Err("无法解析 CodeBuddy JSON 导入内容".to_string())
 }
 
-fn import_from_json_value(value: Value) -> Result<Vec<CodebuddyAccount>, String> {
+fn import_from_json_value(mut value: Value) -> Result<Vec<CodebuddyAccount>, String> {
+    // 粘贴/文件导入的 JSON 可能带 `$wbEncrypted` 信封；有信封就地解密，
+    // 无明文节点则是 no-op（旧版格式向后兼容）。
+    crate::modules::at_rest::decrypt_json_in_place(
+        &mut value,
+        &crate::modules::at_rest::data_dir(),
+    )?;
     match value {
         Value::Array(items) => {
             if items.is_empty() {
@@ -1332,7 +1338,15 @@ pub fn import_payload_from_local() -> Result<Option<CodebuddyOAuthCompletePayloa
         return Ok(None);
     };
 
-    let parsed_json = serde_json::from_str::<Value>(&secret).ok();
+    let mut parsed_json = serde_json::from_str::<Value>(&secret).ok();
+    if let Some(value) = parsed_json.as_mut() {
+        // CodeBuddy CN 若升级为 `$wbEncrypted` 信封格式则就地解密；
+        // 当前/旧版明文格式没有信封节点，此调用是 no-op（向后兼容）。
+        crate::modules::at_rest::decrypt_json_in_place(
+            value,
+            &crate::modules::at_rest::data_dir(),
+        )?;
+    }
     let token_candidate = parsed_json
         .as_ref()
         .and_then(parse_local_access_token)

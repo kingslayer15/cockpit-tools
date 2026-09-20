@@ -849,7 +849,13 @@ pub fn import_from_json(json_content: &str) -> Result<Vec<WorkbuddyAccount>, Str
     Err("无法解析 WorkBuddy JSON 导入内容".to_string())
 }
 
-fn import_from_json_value(value: Value) -> Result<Vec<WorkbuddyAccount>, String> {
+fn import_from_json_value(mut value: Value) -> Result<Vec<WorkbuddyAccount>, String> {
+    // 粘贴/文件导入的 JSON 也可能带 `$wbEncrypted` 信封（例如直接导入
+    // workbuddy-desktop.info 原文）；有信封就地解密，无明文节点则是 no-op。
+    crate::modules::at_rest::decrypt_json_in_place(
+        &mut value,
+        &crate::modules::at_rest::data_dir(),
+    )?;
     match value {
         Value::Array(items) => {
             if items.is_empty() {
@@ -1587,7 +1593,15 @@ pub fn import_payload_from_local() -> Result<Option<WorkbuddyOAuthCompletePayloa
     let secret = fs::read_to_string(&auth_file)
         .map_err(|e| format!("读取本机 WorkBuddy 登录信息失败: {}", e))?;
 
-    let parsed_json = serde_json::from_str::<Value>(&secret).ok();
+    let mut parsed_json = serde_json::from_str::<Value>(&secret).ok();
+    if let Some(value) = parsed_json.as_mut() {
+        // WorkBuddy 5.3.13+（含 5.6.0）的 `$wbEncrypted` 信封就地解密；
+        // 旧版明文格式没有信封节点，此调用是 no-op（向后兼容）。
+        crate::modules::at_rest::decrypt_json_in_place(
+            value,
+            &crate::modules::at_rest::data_dir(),
+        )?;
+    }
     let token_candidate = parsed_json
         .as_ref()
         .and_then(parse_local_access_token)
@@ -1946,5 +1960,94 @@ mod client_auth_session_tests {
         assert!(!contains_encrypted_wrapper(&json!({
             "auth": { "accessToken": "plaintext-current-build" }
         })));
+    }
+
+    /// 向后兼容：旧版明文 JSON 导入不受 at-rest 解密接线影响（无信封 = no-op）。
+    #[test]
+    fn plaintext_import_still_works_after_at_rest_wiring() {
+        let imported = import_from_json(
+            &json!({
+                "accessToken": "uid-1+eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1aWQtMSJ9.sig",
+                "email": "old@example.com",
+                "uid": "uid-1",
+                "nickname": "旧版明文"
+            })
+            .to_string(),
+        )
+        .expect("明文导入必须成功");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].uid.as_deref(), Some("uid-1"));
+        assert_eq!(imported[0].email, "old@example.com");
+    }
+
+    /// 粘贴加密 JSON（workbuddy-desktop.info 原文）且取不到钥时，
+    /// 报错必须是"密钥/启动客户端"这种人话，而不是"缺少 access_token"。
+    #[test]
+    fn encrypted_import_without_key_reports_real_reason() {
+        use base64::Engine as _;
+        let env = base64::engine::general_purpose::STANDARD.encode(
+            json!({
+                "suite": 1,
+                "keyId": "0000000000000000",
+                "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
+                "authTag": base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 8]),
+            })
+            .to_string(),
+        );
+        let err = import_from_json(
+            &json!({
+                "account": {"uid": "u", "nickname": {"$wbEncrypted": 1, "envelope": env}},
+                "auth": {"accessToken": {"$wbEncrypted": 1, "envelope": env}}
+            })
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("密钥") || err.contains("at-rest") || err.contains("客户端"),
+            "err={err}"
+        );
+    }
+
+    /// **真实数据端到端验收**（默认 `#[ignore]`，手工跑）：
+    /// 用本机真实的 `workbuddy-desktop.info`（5.3.13+/5.6.0 密文）走完整条
+    /// 「读文件 → 解密 → 构造导入 payload」链路。
+    ///
+    /// 前置：WorkBuddy 客户端正在运行（密钥取自它的主进程内存）；
+    /// 在提权终端里跑可覆盖内存扫描路径，普通终端则要求缓存已落盘。
+    ///
+    /// ```bash
+    /// cd src-tauri && cargo test --release --lib -- --ignored --nocapture at_rest_real_local_import
+    /// ```
+    #[test]
+    #[ignore = "需要本机 WorkBuddy 正在运行 + 已生成加密的 workbuddy-desktop.info"]
+    fn at_rest_real_local_import() {
+        let payload = import_payload_from_local()
+            .expect("本机登录态读取/解密失败")
+            .expect("本机没有 WorkBuddy 登录态");
+        println!(
+            "[real] uid={:?} email={} token={} 字符 refresh={:?}",
+            payload.uid,
+            payload.email,
+            payload.access_token.len(),
+            payload.refresh_token.as_ref().map(|s| s.len())
+        );
+        assert!(!payload.access_token.is_empty(), "access_token 为空");
+        assert_eq!(
+            payload.access_token.matches('.').count(),
+            2,
+            "access_token 不是 JWT 三段（说明 $wbEncrypted 没解开）"
+        );
+        assert!(
+            payload.uid.as_deref().unwrap_or("").len() > 0,
+            "uid 为空 ⇒ 去重失效"
+        );
+        // auth_raw 里不应再残留加密信封（解密是就地进行的）
+        if let Some(raw) = payload.auth_raw.as_ref() {
+            assert!(
+                !contains_encrypted_wrapper(raw),
+                "auth_raw 里仍有 $wbEncrypted 节点"
+            );
+        }
     }
 }

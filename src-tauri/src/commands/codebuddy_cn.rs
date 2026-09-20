@@ -46,7 +46,14 @@ pub fn import_codebuddy_cn_from_json(
 pub async fn import_codebuddy_cn_from_local(
     app: AppHandle,
 ) -> Result<Vec<CodebuddyAccount>, String> {
-    let mut local_payload = match codebuddy_cn_account::import_payload_from_local()? {
+    // 首次导入可能需要扫客户端进程内存取 at-rest 密钥（GB 级只读扫描），
+    // 放到 blocking 线程池，避免卡住 async runtime。
+    let mut local_payload = match tokio::task::spawn_blocking(
+        codebuddy_cn_account::import_payload_from_local,
+    )
+    .await
+    .map_err(|e| format!("读取本机 CodeBuddy 登录信息任务失败: {}", e))??
+    {
         Some(payload) => payload,
         None => return Err("未在本机 CodeBuddy 客户端中找到登录信息".to_string()),
     };
